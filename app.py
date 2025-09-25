@@ -1,181 +1,192 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pickle, joblib
 import shap
-from lime.lime_tabular import LimeTabularExplainer
+import joblib
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import LabelEncoder
-import tensorflow as tf
-from io import BytesIO
-import datetime, zipfile, os
+from lime.lime_tabular import LimeTabularExplainer
 
-st.set_page_config(page_title="Intrusion Detection System", layout="wide")
+# ================================================================
+# 🔑 Universal Hashable Converter
+# ================================================================
+def to_hashable(x):
+    import numpy as np
+    import pandas as pd
 
-# ----------------------------
-# Cache Clearing
-# ----------------------------
-def clear_cache():
-    st.cache_resource.clear()
-    st.cache_data.clear()
-
-with st.sidebar:
-    st.button("Clear Cache", on_click=clear_cache)
-    st.markdown("---")
-    st.write("If errors occur after uploading new files, try clearing the cache.")
-
-# ----------------------------
-# Load Resources (Flexible)
-# ----------------------------
-@st.cache_resource(show_spinner="Loading model and preprocessing files...")
-def load_resources():
-    model, scaler, label_encoder, selected_features = None, None, None, None
-
-    # Priority: load deep model if available
-    if os.path.exists("cnn_bilstm_model.h5"):
-        model = tf.keras.models.load_model("cnn_bilstm_model.h5")
-        with open("scaler.pkl", "rb") as f:
-            scaler = pickle.load(f)
-        with open("label_encoder.pkl", "rb") as f:
-            label_encoder = pickle.load(f)
-        with open("selected_features.txt", "r") as f:
-            selected_features = [line.strip() for line in f.readlines()]
-        model_type = "keras"
-
-    # Fallback: load joblib model
-    elif os.path.exists("model.pkl"):
-        model = joblib.load("model.pkl")
-        # Optional: load preprocessing
-        if os.path.exists("scaler.pkl"):
-            with open("scaler.pkl", "rb") as f:
-                scaler = pickle.load(f)
-        if os.path.exists("label_encoder.pkl"):
-            with open("label_encoder.pkl", "rb") as f:
-                label_encoder = pickle.load(f)
-        if os.path.exists("selected_features.txt"):
-            with open("selected_features.txt", "r") as f:
-                selected_features = [line.strip() for line in f.readlines()]
-        model_type = "sklearn"
-
+    if isinstance(x, (np.ndarray, pd.Series)):
+        return x.tolist()
+    elif isinstance(x, pd.DataFrame):
+        return x.to_dict(orient="list")
+    elif isinstance(x, (list, tuple, set)):
+        return tuple(to_hashable(i) for i in x)
+    elif isinstance(x, dict):
+        return {k: to_hashable(v) for k, v in x.items()}
     else:
-        st.error("No model file found. Upload either cnn_bilstm_model.h5 or model.pkl")
-        st.stop()
+        return x
 
-    return model, scaler, label_encoder, selected_features, model_type
 
-model, scaler, label_encoder, selected_features, model_type = load_resources()
+# ================================================================
+# 🔧 Cached Functions
+# ================================================================
+@st.cache_resource(show_spinner="Loading trained model...")
+def load_model(path: str):
+    try:
+        model = joblib.load(path)
+        st.success("✅ Model loaded successfully")
+        return model
+    except FileNotFoundError:
+        st.error(f"❌ Model file not found at: {path}")
+        return None
+    except Exception as e:
+        st.error(f"⚠️ Error loading model: {e}")
+        return None
 
-# ----------------------------
-# Prediction Helper
-# ----------------------------
-def predict_func(x_2d):
-    """Unified predict for both keras and sklearn models."""
-    x_arr = np.array(x_2d, dtype=np.float32)
-    if model_type == "keras":
-        x_reshaped = x_arr.reshape(x_arr.shape[0], x_arr.shape[1], 1)
-        preds = model.predict(x_reshaped, verbose=0)
-    else:  # sklearn
-        preds = model.predict_proba(x_arr)
-    return preds
 
-# ----------------------------
-# SHAP + LIME Setup
-# ----------------------------
-@st.cache_resource
-def get_shap_explainer(data, labels):
-    return shap.KernelExplainer(predict_func, shap.sample(data, 50))
+@st.cache_resource(show_spinner="Preparing SHAP explainer...")
+def get_shap_explainer(data, labels, predict_func):
+    try:
+        data = np.array(data, dtype=np.float32)
+        labels = to_hashable(labels)
 
-@st.cache_resource
+        unique_labels = set(labels)
+        background_samples = []
+
+        for label in unique_labels:
+            try:
+                idx = labels.index(label) if label in labels else None
+                if idx is not None:
+                    background_samples.append(data[idx])
+            except Exception:
+                pass
+
+        background = np.array(background_samples, dtype=np.float32)
+
+        if background.shape[0] < 2:  # fallback
+            rng = np.random.default_rng(seed=42)
+            bg_idx = rng.choice(data.shape[0], size=min(50, data.shape[0]), replace=False)
+            background = data[bg_idx]
+
+        explainer = shap.KernelExplainer(predict_func, background)
+        st.success("✅ SHAP explainer initialized")
+        return explainer
+    except Exception as e:
+        st.error(f"⚠️ Error initializing SHAP explainer: {e}")
+        return None
+
+
+@st.cache_resource(show_spinner="Preparing LIME explainer...")
 def get_lime_explainer(data, feature_names, class_names):
-    return LimeTabularExplainer(
-        data, feature_names=feature_names, class_names=class_names, mode="classification"
-    )
+    try:
+        data = np.array(data, dtype=np.float32)
+        feature_names = to_hashable(feature_names)
+        class_names = [str(c) for c in to_hashable(class_names)]
 
-# ----------------------------
-# Plot Helpers
-# ----------------------------
-def fig_to_bytes(fig):
-    buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    buf.seek(0)
-    return buf
+        explainer = LimeTabularExplainer(
+            data,
+            feature_names=feature_names,
+            class_names=class_names,
+            mode="classification"
+        )
+        st.success("✅ LIME explainer initialized")
+        return explainer
+    except Exception as e:
+        st.error(f"⚠️ Error initializing LIME explainer: {e}")
+        return None
 
-def plot_shap_local(shap_values, feature_names, title="SHAP Local Explanation"):
-    fig, ax = plt.subplots(figsize=(7, 4))
-    order = np.argsort(np.abs(shap_values))[::-1]
-    top_n = min(20, len(feature_names))
-    ax.barh(np.array(feature_names)[order][:top_n][::-1], shap_values[order][:top_n][::-1])
-    ax.set_xlabel("SHAP value (impact)")
-    ax.set_title(title)
-    plt.tight_layout()
-    return fig
 
-# ----------------------------
-# UI
-# ----------------------------
-st.title("🛡️ Network Intrusion Detection System — Unified")
-st.markdown("Upload a CSV file with network traffic data to get predictions and explanations.")
-st.info(f"Required features: {', '.join(selected_features) if selected_features else 'All columns used'}")
+# ================================================================
+# 🚀 Streamlit App
+# ================================================================
+st.title("🚨 Network Intrusion Detection System with Explainability")
 
-uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
-if uploaded_file is None:
-    st.stop()
+# ---- Upload model
+st.sidebar.header("Upload Model")
+model_file = st.sidebar.file_uploader("Upload your trained model (.pkl)", type=["pkl"])
 
-# ----------------------------
-# Preprocess & Predict
-# ----------------------------
-df = pd.read_csv(uploaded_file)
-if selected_features:
-    missing = [c for c in selected_features if c not in df.columns]
-    if missing:
-        st.error(f"Missing required columns: {', '.join(missing)}")
-        st.stop()
-    df_sel = df[selected_features].copy()
+if model_file:
+    with open("uploaded_model.pkl", "wb") as f:
+        f.write(model_file.read())
+    model = load_model("uploaded_model.pkl")
 else:
-    df_sel = df.copy()
+    model = None
+    st.warning("⚠️ Please upload a trained model to continue.")
 
-df_sel.replace([np.inf, -np.inf], np.nan, inplace=True)
-df_sel.dropna(inplace=True)
+# ---- Upload dataset
+st.sidebar.header("Upload Dataset")
+data_file = st.sidebar.file_uploader("Upload CSV dataset", type=["csv"])
 
-if scaler is not None:
-    X_scaled = scaler.transform(df_sel)
+if data_file:
+    df = pd.read_csv(data_file)
+    st.subheader("📊 Data Preview")
+    st.write(df.head())
 else:
-    X_scaled = df_sel.values
+    df = None
+    st.info("ℹ️ Upload a CSV dataset to proceed.")
 
-probs = predict_func(X_scaled)
-preds = np.argmax(probs, axis=1)
 
-if label_encoder is not None:
-    preds_labels = label_encoder.inverse_transform(preds)
-else:
-    preds_labels = preds
+# ---- Run Prediction
+if model and df is not None:
+    st.subheader("🔎 Run Predictions")
 
-results_df = df.loc[df_sel.index].copy()
-results_df["Predicted_Label"] = preds_labels
-results_df["Predicted_Probability"] = np.max(probs, axis=1)
+    X = df.select_dtypes(include=[np.number])  # only numeric
+    preds = model.predict(X)
+    df["Prediction"] = preds
+    st.write("✅ Predictions generated")
+    st.dataframe(df.head())
 
-# ----------------------------
-# Tabs
-# ----------------------------
-tab1, tab2 = st.tabs(["📊 Predictions", "🔎 Explainability"])
 
-with tab1:
-    st.subheader("Data Preview")
-    st.dataframe(results_df.head())
-    st.subheader("Prediction Distribution")
-    st.bar_chart(results_df["Predicted_Label"].value_counts())
+# ---- Explainability
+if model and df is not None:
+    st.subheader("🧠 Explainability")
 
-with tab2:
-    shap_explainer = get_shap_explainer(X_scaled, preds)
-    lime_explainer = get_lime_explainer(X_scaled, df_sel.columns, np.unique(preds_labels))
+    X = df.select_dtypes(include=[np.number])
+    preds = df["Prediction"].tolist()
+    class_names = np.unique(preds)
 
-    row_id = st.number_input("Pick row index:", 0, len(X_scaled)-1, 0)
-    row_data = X_scaled[row_id:row_id+1]
+    # Pick class
+    st.markdown("### 🎯 Select Class & Row for Explanation")
+    chosen_class = st.selectbox("Choose a predicted class:", class_names)
 
-    shap_vals = shap_explainer.shap_values(row_data)
-    fig_shap = plot_shap_local(np.array(shap_vals[np.argmax(probs[row_id])])[0], df_sel.columns)
-    st.pyplot(fig_shap)
+    filtered_idx = df[df["Prediction"] == chosen_class].index.tolist()
 
-    exp = lime_explainer.explain_instance(X_scaled[row_id], predict_func, num_features=10)
-    st.pyplot(exp.as_pyplot_figure())
+    if filtered_idx:
+        row_idx = st.selectbox("Select row index from chosen class:", filtered_idx)
+        sample = X.loc[[row_idx]]
+
+        # --- Show raw feature values
+        st.markdown(f"### 📝 Feature Values for Row {row_idx} (Class: {chosen_class})")
+        st.dataframe(sample.T.rename(columns={row_idx: "Value"}))
+
+        # SHAP
+        if st.checkbox("Enable SHAP Explanation"):
+            shap_explainer = get_shap_explainer(X, preds, model.predict_proba)
+            if shap_explainer:
+                shap_values = shap_explainer.shap_values(sample)
+
+                st.markdown(f"### 🔍 SHAP Force Plot (Row {row_idx}, Class {chosen_class})")
+                shap.initjs()
+                st_shap = shap.force_plot(
+                    shap_explainer.expected_value[0], shap_values[0], sample, matplotlib=False
+                )
+                st.components.v1.html(st_shap.html(), height=300)
+
+                st.markdown("### 📊 SHAP Summary Plot (Global Importance)")
+                fig, ax = plt.subplots()
+                shap.summary_plot(shap_values, X, feature_names=X.columns, plot_type="bar", show=False)
+                st.pyplot(fig)
+                plt.close(fig)
+
+        # LIME
+        if st.checkbox("Enable LIME Explanation"):
+            lime_explainer = get_lime_explainer(X, X.columns, class_names)
+            if lime_explainer:
+                exp = lime_explainer.explain_instance(
+                    sample.values[0], model.predict_proba, num_features=10
+                )
+
+                st.markdown(f"### 🔍 LIME Explanation (Row {row_idx}, Class {chosen_class})")
+                fig = exp.as_pyplot_figure()
+                st.pyplot(fig)
+                plt.close(fig)
+    else:
+        st.warning(f"No rows found for class `{chosen_class}`.")
