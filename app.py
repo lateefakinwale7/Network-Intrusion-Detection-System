@@ -32,6 +32,8 @@ if 'full_results_df' not in st.session_state:
     st.session_state.full_results_df = None
 if 'df_sel_all' not in st.session_state:
     st.session_state.df_sel_all = None
+if 'df_full' not in st.session_state: # 👈 ADDED: Full DataFrame
+    st.session_state.df_full = None 
 if 'total_valid_rows' not in st.session_state:
     st.session_state.total_valid_rows = 0
 
@@ -204,8 +206,7 @@ def load_and_clean_data(uploaded_file):
         
     st.session_state.total_valid_rows = df_sel_all.shape[0]
     
-    return df, df_sel_all
-
+    return df, df_sel_all # Return both
 
 # ----------------------------
 # Main App UI
@@ -224,11 +225,12 @@ if uploaded_file is None:
     
 # --- Load Data on Upload ---
 try:
-    if st.session_state.df_sel_all is None:
+    if st.session_state.df_full is None or st.session_state.df_sel_all is None: # Check state
         # Only run load_and_clean_data once per uploaded file
-        df_full, st.session_state.df_sel_all = load_and_clean_data(uploaded_file)
+        st.session_state.df_full, st.session_state.df_sel_all = load_and_clean_data(uploaded_file)
         
-    df_full = df_full # Use the full dataframe for context
+    # --- Assign local variables from session state ---
+    df_full = st.session_state.df_full # 👈 Defined here
     df_sel_all = st.session_state.df_sel_all
     N_ROWS = st.session_state.total_valid_rows
     N_BATCHES = int(np.ceil(N_ROWS / BATCH_SIZE))
