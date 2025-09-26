@@ -13,25 +13,30 @@ import zipfile
 from io import BytesIO
 import os
 import time
-import gc
-import psutil
 
+# --- Configuration ---
 st.set_page_config(page_title="Intrusion Detection System", layout="wide")
 
-# ----------------------------
-# Memory Management Functions
-# ----------------------------
-def check_memory_safe(threshold=85):
-    """Check if memory usage is safe to proceed."""
-    try:
-        memory = psutil.virtual_memory()
-        return memory.percent < threshold
-    except:
-        return True  # If we can't check memory, proceed anyway
+# --- Constants ---
+BATCH_SIZE = 100000 
+MAX_ROWS_FOR_EXPLANATION = 50 # Hard limit for batch export
 
-def clear_memory():
-    """Force garbage collection."""
-    gc.collect()
+# --- Session State Initialization ---
+# We no longer accumulate data, so these hold ONLY the current batch results.
+if 'batch_offset' not in st.session_state:
+    st.session_state.batch_offset = 0
+if 'current_scaled_data' not in st.session_state: # 👈 CHANGED: Holds current batch's scaled data
+    st.session_state.current_scaled_data = None
+if 'current_predictions' not in st.session_state: # 👈 CHANGED: Holds current batch's predictions
+    st.session_state.current_predictions = None
+if 'current_results_df' not in st.session_state: # 👈 CHANGED: Holds current batch's full results
+    st.session_state.current_results_df = None
+if 'df_sel_all' not in st.session_state:
+    st.session_state.df_sel_all = None
+if 'df_full' not in st.session_state:
+    st.session_state.df_full = None 
+if 'total_valid_rows' not in st.session_state:
+    st.session_state.total_valid_rows = 0
 
 # ----------------------------
 # Cache Clearing Function
@@ -39,11 +44,16 @@ def clear_memory():
 def clear_cache():
     st.cache_resource.clear()
     st.cache_data.clear()
-    clear_memory()
+    # Reset session state for a fresh start
+    for key in list(st.session_state.keys()):
+        # Exclude only 'batch_offset' for a controlled start, but reset others
+        if key not in ['batch_offset']:
+             del st.session_state[key]
+    st.session_state.batch_offset = 0
 
 # Add a button to the sidebar to clear the cache
 with st.sidebar:
-    st.button("Clear Cache", on_click=clear_cache)
+    st.button("Clear Cache & Reset Data", on_click=clear_cache)
     st.markdown("---")
     st.write("If you encounter errors after uploading a new file, try clearing the cache.")
 
@@ -60,9 +70,17 @@ def load_resources():
             label_encoder = pickle.load(f)
         with open('selected_features.txt', 'r') as f:
             selected_features = [line.strip() for line in f.readlines()]
+            
+        # CRITICAL CHECK: Ensure the loaded object has the inverse_transform method
+        if not hasattr(label_encoder, 'inverse_transform'):
+            raise TypeError("Loaded label_encoder object does not have the 'inverse_transform' method. Check your 'label_encoder.pkl' file.")
+            
         return model, scaler, label_encoder, selected_features
     except FileNotFoundError as e:
         st.error(f"Missing required file: {e}")
+        st.stop()
+    except TypeError as e:
+        st.error(f"Resource Loading Error: {e}")
         st.stop()
 
 model, scaler, label_encoder, selected_features = load_resources()
@@ -86,256 +104,45 @@ def predict_2d_to_3d(x_2d):
     return preds
 
 # ----------------------------
-# Explainers with Sampling
+# Explainers Caching
 # ----------------------------
-@st.cache_resource(show_spinner="Preparing SHAP explainer with sampling...")
-def get_shap_explainer_sampled(data, labels, max_samples=1000):
-    """Initializes SHAP explainer with smart sampling for large datasets."""
+# NOTE: The explainer is now initialized/cached based on the *first* batch
+# that successfully runs, or re-used if the shape matches.
+@st.cache_resource(show_spinner="Preparing SHAP explainer...")
+def get_shap_explainer(data, labels):
+    """Initializes and caches the SHAP KernelExplainer with a fixed, small background dataset."""
     
-    # If dataset is large, sample strategically
-    if data.shape[0] > max_samples:
-        st.info(f"Large dataset detected ({data.shape[0]} rows). Sampling {max_samples} rows for explainability.")
-        
-        # Stratified sampling to maintain class distribution
-        unique_labels, label_counts = np.unique(labels, return_counts=True)
-        samples_per_class = max(1, max_samples // len(unique_labels))
-        
-        sampled_indices = []
-        for label in unique_labels:
-            label_indices = np.where(labels == label)[0]
-            # Ensure we have at least 1 sample per class, but not more than available
-            n_samples = min(samples_per_class, len(label_indices))
-            if n_samples > 0:
-                selected = np.random.choice(label_indices, size=n_samples, replace=False)
-                sampled_indices.extend(selected)
-        
-        # If we need more samples, fill randomly
-        if len(sampled_indices) < max_samples:
-            remaining = max_samples - len(sampled_indices)
-            all_indices = np.arange(data.shape[0])
-            unused_indices = np.setdiff1d(all_indices, sampled_indices)
-            if len(unused_indices) > 0:
-                additional = np.random.choice(unused_indices, 
-                                            size=min(remaining, len(unused_indices)), 
-                                            replace=False)
-                sampled_indices.extend(additional)
-        
-        data = data[sampled_indices]
-        labels = labels[sampled_indices]
+    # CRITICAL: Use a fixed, small sample for the background.
+    BACKGROUND_SIZE = 50 
     
-    # Create balanced background
-    unique_labels = np.unique(labels)
-    background_samples = []
+    rng = np.random.default_rng(seed=42)
     
-    for label in unique_labels:
-        sample_indices = np.where(labels == label)[0]
-        if len(sample_indices) > 0:
-            # Take up to 5 samples per class for background
-            n_background = min(5, len(sample_indices))
-            background_samples.extend(
-                data[sample_indices[:n_background]]
-            )
-    
-    background = np.array(background_samples)
-    
-    # Fallback if background is too small
-    if background.shape[0] < 2:
-        rng = np.random.default_rng(seed=42)
-        bg_idx = rng.choice(data.shape[0], size=min(50, data.shape[0]), replace=False)
+    if data.shape[0] <= BACKGROUND_SIZE:
+        background = data
+    else:
+        # Use a random subset if the data is large
+        bg_idx = rng.choice(data.shape[0], size=BACKGROUND_SIZE, replace=False)
         background = data[bg_idx]
+        
+    st.info(f"Using {background.shape[0]} samples for SHAP KernelExplainer background.")
     
     return shap.KernelExplainer(predict_2d_to_3d, background)
 
-@st.cache_resource(show_spinner="Preparing LIME explainer with sampling...")
-def get_lime_explainer_sampled(data, feature_names, class_names, max_samples=5000):
-    """Initializes LIME explainer with sampling for large datasets."""
-    
-    # Sample data for LIME training (LIME uses data for statistics)
-    if data.shape[0] > max_samples:
-        st.info(f"Sampling {max_samples} rows for LIME explainer initialization.")
-        rng = np.random.default_rng(seed=42)
-        sample_idx = rng.choice(data.shape[0], size=max_samples, replace=False)
-        data = data[sample_idx]
-    
+@st.cache_resource(show_spinner="Preparing LIME explainer...")
+def get_lime_explainer(data, feature_names, class_names):
+    """Initializes and caches the LIME TabularExplainer."""
+    # Data is used here primarily to derive feature means/std for sampling,
+    # which is consistent across all batches (as they are scaled using the same scaler).
+    # We pass the current batch data, but the explainer essentially fixes its properties after the first call.
     return LimeTabularExplainer(
         data,
         feature_names=feature_names,
         class_names=class_names,
-        mode='classification',
-        discretize_continuous=False,  # Reduces memory usage
-        random_state=42
+        mode='classification'
     )
 
 # ----------------------------
-# Batch Processing Functions
-# ----------------------------
-def process_batch_shap(shap_explainer, data_batch, preds_batch, batch_size=10):
-    """Process SHAP explanations in batches to manage memory."""
-    shap_results = []
-    
-    for i in range(0, len(data_batch), batch_size):
-        batch_end = min(i + batch_size, len(data_batch))
-        batch_data = data_batch[i:batch_end]
-        batch_preds = preds_batch[i:batch_end]
-        
-        # Process current batch
-        with st.spinner(f"Processing SHAP batch {i//batch_size + 1}/{(len(data_batch)-1)//batch_size + 1}..."):
-            for j in range(len(batch_data)):
-                row_idx = i + j
-                try:
-                    shap_vals = shap_explainer.shap_values(
-                        batch_data[j:j+1], 
-                        nsamples=50  # Reduced for batch processing
-                    )
-                    pred_class_idx = int(batch_preds[j])
-                    
-                    if pred_class_idx < len(shap_vals):
-                        shap_for_row = np.array(shap_vals[pred_class_idx])[0]
-                        shap_results.append({
-                            'row_index': row_idx,
-                            'shap_values': shap_for_row,
-                            'prediction': pred_class_idx
-                        })
-                    else:
-                        shap_results.append({
-                            'row_index': row_idx,
-                            'shap_values': None,
-                            'prediction': pred_class_idx
-                        })
-                except Exception as e:
-                    st.warning(f"SHAP failed for row {row_idx}: {e}")
-                    shap_results.append({
-                        'row_index': row_idx,
-                        'shap_values': None,
-                        'prediction': pred_class_idx
-                    })
-        
-        # Clear memory after each batch
-        gc.collect()
-        
-    return shap_results
-
-def process_batch_lime(lime_explainer, data_batch, preds_batch, batch_size=5):
-    """Process LIME explanations in batches (LIME is more memory intensive)."""
-    lime_results = []
-    
-    for i in range(0, len(data_batch), batch_size):
-        batch_end = min(i + batch_size, len(data_batch))
-        batch_data = data_batch[i:batch_end]
-        batch_preds = preds_batch[i:batch_end]
-        
-        # Process current batch
-        with st.spinner(f"Processing LIME batch {i//batch_size + 1}/{(len(data_batch)-1)//batch_size + 1}..."):
-            for j in range(len(batch_data)):
-                row_idx = i + j
-                try:
-                    exp = lime_explainer.explain_instance(
-                        batch_data[j],
-                        predict_2d_to_3d,
-                        num_features=8  # Reduced for batch processing
-                    )
-                    
-                    lime_results.append({
-                        'row_index': row_idx,
-                        'explanation': exp,
-                        'feature_contributions': exp.as_list(),
-                        'prediction': batch_preds[j]
-                    })
-                except Exception as e:
-                    st.warning(f"LIME failed for row {row_idx}: {e}")
-                    lime_results.append({
-                        'row_index': row_idx,
-                        'explanation': None,
-                        'feature_contributions': [],
-                        'prediction': batch_preds[j]
-                    })
-        
-        # Clear memory after each batch (LIME is memory intensive)
-        gc.collect()
-        
-    return lime_results
-
-def create_explanations_zip(shap_results, lime_results, feature_names, original_indices):
-    """Create ZIP file from batched results."""
-    zip_buf = BytesIO()
-    
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Add global summary if available
-        if len(shap_results) > 0:
-            try:
-                # Create a simple global importance from batch
-                all_shap_vals = [r['shap_values'] for r in shap_results if r['shap_values'] is not None]
-                if len(all_shap_vals) > 0:
-                    mean_abs_shap = np.mean(np.abs(all_shap_vals), axis=0)
-                    fig_glob = plot_shap_global_batch(mean_abs_shap, feature_names)
-                    zf.writestr("shap_global_summary.png", fig_to_bytes(fig_glob).getvalue())
-                    plt.close(fig_glob)
-            except Exception as e:
-                st.warning(f"Global SHAP summary failed: {e}")
-        
-        # Add individual explanation files
-        successful_exports = 0
-        
-        for i, (shap_res, lime_res) in enumerate(zip(shap_results, lime_results)):
-            original_idx = original_indices[i]
-            
-            try:
-                # SHAP plot
-                if shap_res['shap_values'] is not None:
-                    fig_shap = plot_shap_local(
-                        shap_res['shap_values'], 
-                        feature_names, 
-                        f"SHAP Row {original_idx}"
-                    )
-                    zf.writestr(f"shap_row_{original_idx}.png", fig_to_bytes(fig_shap).getvalue())
-                    plt.close(fig_shap)
-                
-                # LIME plot
-                if lime_res['explanation'] is not None:
-                    fig_lime = plot_lime_local(
-                        lime_res['explanation'], 
-                        f"LIME Row {original_idx}"
-                    )
-                    zf.writestr(f"lime_row_{original_idx}.png", fig_to_bytes(fig_lime).getvalue())
-                    plt.close(fig_lime)
-                
-                successful_exports += 1
-                
-            except Exception as e:
-                st.warning(f"Failed to create plots for row {original_idx}: {e}")
-                continue
-        
-        # Add CSV with all LIME contributions
-        lime_data = []
-        for res in lime_results:
-            if res['feature_contributions']:
-                for feature, contribution in res['feature_contributions']:
-                    lime_data.append({
-                        'Row_Index': original_indices[res['row_index']],
-                        'Feature': feature,
-                        'Contribution': contribution
-                    })
-        
-        if lime_data:
-            lime_df = pd.DataFrame(lime_data)
-            zf.writestr("lime_contributions.csv", lime_df.to_csv(index=False).encode('utf-8'))
-    
-    return zip_buf, successful_exports
-
-def plot_shap_global_batch(mean_abs_shap, feature_names):
-    """Create global SHAP plot from batched results."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-    feat = np.array(feature_names)
-    order = np.argsort(mean_abs_shap)[::-1]
-    
-    ax.barh(feat[order][:20][::-1], mean_abs_shap[order][:20][::-1])
-    ax.set_title("Global Feature Importance (Mean |SHAP| from batch)")
-    ax.set_xlabel("Mean |SHAP value|")
-    plt.tight_layout()
-    return fig
-
-# ----------------------------
-# Plotting Functions
+# Plotting Functions (Unchanged)
 # ----------------------------
 def fig_to_bytes(fig):
     """Converts a matplotlib figure to a PNG byte stream."""
@@ -363,13 +170,19 @@ def plot_lime_local(lime_exp, title="LIME Local Explanation"):
     plt.tight_layout()
     return fig
 
-def plot_shap_global(shap_explainer, data, feature_names, n_samples=200):
-    """Generates a global SHAP feature importance plot."""
+def plot_shap_global(shap_explainer, data, feature_names, n_samples=50):
+    """Generates a global SHAP feature importance plot on a small, safe sample."""
     fig, ax = plt.subplots(figsize=(10, 6))
     subset_n = min(n_samples, data.shape[0])
+    if subset_n == 0:
+        st.warning("Not enough data to generate global plot.")
+        return plt.figure()
+        
     rng = np.random.default_rng(seed=42)
     global_idx = rng.choice(data.shape[0], size=subset_n, replace=False)
-    shap_vals_global = shap_explainer.shap_values(data[global_idx], nsamples=100)
+    
+    # SHAP calculation is costly, reduced nsamples here too for speed
+    shap_vals_global = shap_explainer.shap_values(data[global_idx], nsamples=50) 
     
     mean_abs_per_class = np.array([np.mean(np.abs(sv), axis=0) for sv in shap_vals_global])
     mean_abs_across_classes = np.mean(mean_abs_per_class, axis=0)
@@ -378,16 +191,43 @@ def plot_shap_global(shap_explainer, data, feature_names, n_samples=200):
     orderg = np.argsort(mean_abs_across_classes)[::-1]
     
     ax.barh(feat[orderg][:30][::-1], mean_abs_across_classes[orderg][:30][::-1])
-    ax.set_title("Global Feature Importance (Mean |SHAP| across classes)")
+    ax.set_title(f"Global Feature Importance (Mean |SHAP| across {subset_n} samples)")
     ax.set_xlabel("Mean |SHAP value|")
     plt.tight_layout()
     return fig
 
+
+# ----------------------------
+# Data Loading & Preprocessing (Cached)
+# ----------------------------
+@st.cache_data(show_spinner="Reading and cleaning file structure...")
+def load_and_clean_data(uploaded_file):
+    try:
+        df = pd.read_csv(uploaded_file)
+    except Exception as e:
+        raise Exception(f"Failed to read CSV: {e}")
+
+    missing = [c for c in selected_features if c not in df.columns]
+    if missing:
+        raise Exception(f"CSV is missing required columns: {', '.join(missing)}")
+
+    # Create a copy with only selected features and handle NaNs/Infs
+    df_sel_all = df[selected_features].copy()
+    df_sel_all.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_sel_all.dropna(inplace=True)
+    
+    if df_sel_all.empty:
+        raise Exception("No valid data found after cleaning.")
+        
+    st.session_state.total_valid_rows = df_sel_all.shape[0]
+    
+    return df, df_sel_all # Return both
+
 # ----------------------------
 # Main App UI
 # ----------------------------
-st.title("🛡️ Network Intrusion Detection System — with SHAP & LIME")
-st.markdown("Upload a CSV file with network traffic data to get predictions and explanations.")
+st.title("🛡️ Network Intrusion Detection System — Single-Batch Analysis")
+st.markdown("Upload a CSV file and process one batch at a time to manage memory.")
 st.markdown("---")
 st.info("Required features: " + ", ".join(selected_features))
 
@@ -395,233 +235,258 @@ uploaded_file = st.file_uploader("Upload network traffic CSV", type=["csv"])
 
 if uploaded_file is None:
     st.info("Please upload a CSV file to begin.")
+    st.session_state.batch_offset = 0
+    st.stop()
+    
+# --- Load Data on Upload ---
+try:
+    if st.session_state.df_full is None or st.session_state.df_sel_all is None:
+        st.session_state.df_full, st.session_state.df_sel_all = load_and_clean_data(uploaded_file)
+        
+    # --- Assign local variables from session state ---
+    df_full = st.session_state.df_full 
+    df_sel_all = st.session_state.df_sel_all
+    N_ROWS = st.session_state.total_valid_rows
+    N_BATCHES = int(np.ceil(N_ROWS / BATCH_SIZE))
+    
+except Exception as e:
+    st.error(f"Data loading failed: {e}")
     st.stop()
 
-# ----------------------------
-# Read, Preprocess & Predict
-# ----------------------------
-with st.spinner("Processing file and generating predictions..."):
-    try:
-        df = pd.read_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
-        st.stop()
-
-    missing = [c for c in selected_features if c not in df.columns]
-    if missing:
-        st.error(f"Uploaded CSV is missing required columns: {', '.join(missing)}")
-        st.stop()
-
-    df_sel = df[selected_features].copy()
-    df_sel.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df_sel.dropna(inplace=True)
-
-    if df_sel.empty:
-        st.error("No valid data found in the uploaded CSV after handling missing values.")
-        st.stop()
-
-    try:
-        X_scaled = scaler.transform(df_sel)
-        X_reshaped = X_scaled.reshape(X_scaled.shape[0], X_scaled.shape[1], 1)
-        preds_probs = model.predict(X_reshaped, verbose=0)
-        preds = np.argmax(preds_probs, axis=1)
-        preds_labels = label_encoder.inverse_transform(preds)
-        
-        results_df = df.loc[df_sel.index].copy()
-        results_df['Predicted_Label'] = preds_labels
-        results_df['Predicted_Probability'] = np.max(preds_probs, axis=1)
-        
-    except Exception as e:
-        st.error(f"Preprocessing or prediction failed: {e}")
-        st.stop()
-
-# Cache the explainers after data is loaded and scaled
-shap_explainer = get_shap_explainer_sampled(X_scaled, preds, max_samples=1000)
-lime_explainer = get_lime_explainer_sampled(X_scaled, selected_features, label_encoder.classes_, max_samples=5000)
 
 # ----------------------------
-# Main Tabs
+# Prediction Batch Processing Logic
 # ----------------------------
-tab1, tab2 = st.tabs(["📊 Predictions", "🔎 Explainability & Export"])
+current_offset = st.session_state.batch_offset
+rows_processed = current_offset
 
-with tab1:
-    st.subheader("Data Preview")
-    st.dataframe(results_df.head())
+st.subheader("Batch Prediction Control")
+col1, col2 = st.columns(2)
+col1.metric("Total Valid Rows", N_ROWS)
+col2.metric("Rows Processed (Cumulative)", rows_processed)
+
+if rows_processed < N_ROWS:
+    batch_index = int(current_offset / BATCH_SIZE)
+    st.info(f"Ready to process **Batch {batch_index + 1} of {N_BATCHES}** (Rows {current_offset + 1} to {min(current_offset + BATCH_SIZE, N_ROWS)})")
     
-    st.subheader("Prediction Distribution")
-    counts = results_df['Predicted_Label'].value_counts()
-    st.bar_chart(counts)
-    st.dataframe(counts.to_frame(name='Count'))
-
-with tab2:
-    st.header("Model Explainability (SHAP + LIME)")
-    st.warning("""
-    **Note for large datasets:** Explainability features use sampling to avoid crashes.
-    - SHAP: Limited to 1,000 background samples
-    - LIME: Limited to 5,000 training samples  
-    - Batch export: Limited to 1,000 rows maximum
-    """)
-    
-    # Individual row explanations
-    st.subheader("Individual Row Explanations")
-    unique_labels = results_df['Predicted_Label'].unique().tolist()
-    selected_class = st.selectbox("Select predicted class to inspect:", unique_labels)
-    class_rows = results_df[results_df['Predicted_Label'] == selected_class]
-
-    if class_rows.empty:
-        st.warning("No rows for the selected class.")
-    else:
-        selected_row_index = st.selectbox(
-            "Select a row index from this class (DataFrame index):", 
-            class_rows.index.tolist()
-        )
-        numpy_row_idx = np.where(df_sel.index.values == selected_row_index)[0][0]
-
-        st.subheader("Selected Row Details")
-        st.dataframe(results_df.loc[[selected_row_index]])
-
-        col_shap, col_lime = st.columns(2)
-
-        # ---------------- SHAP
-        with col_shap:
-            st.subheader("SHAP (KernelExplainer)")
-            with st.spinner("Calculating SHAP values..."):
-                shap_vals = shap_explainer.shap_values(X_scaled[numpy_row_idx:numpy_row_idx+1], nsamples=100)
-                pred_class_idx = int(preds[numpy_row_idx])
-
-            if pred_class_idx < len(shap_vals):
-                shap_for_row = np.array(shap_vals[pred_class_idx])[0]
-
-                fig_local = plot_shap_local(shap_for_row, selected_features, f"Local SHAP for Row {selected_row_index}")
-                st.pyplot(fig_local)
-                plt.close(fig_local)
-            else:
-                st.warning("SHAP explanation failed. The predicted class was not found in the explainer's output.")
-
-        # ---------------- LIME
-        with col_lime:
-            st.subheader("LIME (local)")
-            with st.spinner("Calculating LIME explanation..."):
-                exp = lime_explainer.explain_instance(
-                    X_scaled[numpy_row_idx],
-                    predict_2d_to_3d,
-                    num_features=min(10, len(selected_features))
-                )
-            fig_lime = plot_lime_local(exp, f"LIME Explanation for Row {selected_row_index}")
-            st.pyplot(fig_lime)
-            plt.close(fig_lime)
+    if st.button(f"Process Next Batch ({BATCH_SIZE} rows)"):
+        with st.spinner(f"Processing Batch {batch_index + 1}..."):
+            batch_data = df_sel_all.iloc[current_offset:current_offset + BATCH_SIZE]
             
-            st.write("Top contributions:")
-            st.write(pd.DataFrame(exp.as_list(), columns=["Feature", "Contribution"]))
+            try:
+                # 1. Scale
+                X_scaled_batch = scaler.transform(batch_data)
+                
+                # 2. Reshape & Predict
+                X_reshaped_batch = X_scaled_batch.reshape(X_scaled_batch.shape[0], X_scaled_batch.shape[1], 1)
+                preds_probs_batch = model.predict(X_reshaped_batch, verbose=0)
+                preds_batch = np.argmax(preds_probs_batch, axis=1)
+                preds_labels_batch = label_encoder.inverse_transform(preds_batch)
+                
+                # 3. Store ONLY THE CURRENT BATCH Results
+                batch_df = df_full.loc[batch_data.index].copy()
+                batch_df['Predicted_Label'] = preds_labels_batch
+                batch_df['Predicted_Probability'] = np.max(preds_probs_batch, axis=1)
 
+                st.session_state.current_results_df = batch_df # 👈 Overwrite
+                st.session_state.current_scaled_data = X_scaled_batch # 👈 Overwrite
+                st.session_state.current_predictions = preds_batch # 👈 Overwrite
+
+                # 4. Update Offset and Rerun
+                st.session_state.batch_offset += BATCH_SIZE
+                st.success(f"Batch {batch_index + 1} completed! Analysis is now focused on this batch.")
+                st.rerun() 
+                
+            except Exception as e:
+                st.error(f"Prediction failed for batch starting at row {current_offset}: {e}")
+                
+# ----------------------------
+# Analysis and Display Logic (if any batch has been processed)
+# ----------------------------
+if st.session_state.current_results_df is not None:
+    
+    # Define variables for the current batch analysis
+    results_df = st.session_state.current_results_df
+    X_scaled = st.session_state.current_scaled_data
+    preds = st.session_state.current_predictions
+    
+    current_batch_label = f"Batch {int((st.session_state.batch_offset - results_df.shape[0]) / BATCH_SIZE) + 1}"
+    
+    # Initialize explainers based on the current batch data
+    # (Cached, so they are only computed if the cache key/function arguments change)
+    shap_explainer = get_shap_explainer(X_scaled, preds)
+    lime_explainer = get_lime_explainer(X_scaled, selected_features, label_encoder.classes_)
+
+    # ----------------------------
+    # Main Tabs
+    # ----------------------------
     st.markdown("---")
-    
-    # ----------------------------
-    # Batch Export with True Batching
-    # ----------------------------
-    st.header("📦 Batch Export Explanations (Batched Processing)")
-    
-    # Configuration options
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        batch_size_shap = st.number_input("SHAP batch size", min_value=1, max_value=50, value=10, 
-                                         help="Smaller = less memory, larger = faster")
-    with col2:
-        batch_size_lime = st.number_input("LIME batch size", min_value=1, max_value=20, value=5,
-                                         help="LIME is more memory intensive")
-    with col3:
-        max_rows_export = st.number_input("Max rows to process", 
-                                        min_value=1, 
-                                        max_value=min(1000, X_scaled.shape[0]), 
-                                        value=min(100, X_scaled.shape[0]))
+    st.header(f"Results for: {current_batch_label}")
+    tab1, tab2 = st.tabs(["📊 Predictions", "🔎 Explainability & Export"])
 
-    # Sample selection for export
-    if X_scaled.shape[0] > max_rows_export:
-        st.info(f"Sampling {max_rows_export} rows from {X_scaled.shape[0]} total rows for export.")
+    with tab1:
+        st.subheader("Data Preview")
+        st.dataframe(results_df.head())
         
-        # Stratified sampling to maintain class distribution
-        unique_classes, class_counts = np.unique(preds, return_counts=True)
-        sample_indices = []
-        
-        for class_label in unique_classes:
-            class_indices = np.where(preds == class_label)[0]
-            n_samples_class = max(1, int(max_rows_export * len(class_indices) / len(preds)))
-            n_samples_class = min(n_samples_class, len(class_indices))
-            
-            if n_samples_class > 0:
-                selected = np.random.choice(class_indices, size=n_samples_class, replace=False)
-                sample_indices.extend(selected)
-        
-        # Fill remaining slots randomly if needed
-        if len(sample_indices) < max_rows_export:
-            remaining = max_rows_export - len(sample_indices)
-            all_indices = np.arange(len(preds))
-            unused_indices = np.setdiff1d(all_indices, sample_indices)
-            if len(unused_indices) > 0:
-                additional = np.random.choice(unused_indices, 
-                                            size=min(remaining, len(unused_indices)), 
-                                            replace=False)
-                sample_indices.extend(additional)
-        
-        sample_indices = np.array(sample_indices)
-    else:
-        sample_indices = np.arange(X_scaled.shape[0])
+        st.subheader("Prediction Distribution")
+        counts = results_df['Predicted_Label'].value_counts()
+        st.bar_chart(counts)
+        st.dataframe(counts.to_frame(name='Count'))
 
-    # Final sample
-    X_sample = X_scaled[sample_indices]
-    preds_sample = preds[sample_indices]
-    original_indices = df_sel.index.values[sample_indices]
+    with tab2:
+        st.header(f"Model Explainability for {current_batch_label} (SHAP + LIME)")
+        st.write("Select a predicted row from *this batch* to view detailed explanations.")
 
-    if st.button("🚀 Start Batched Export", type="primary"):
-        
-        # Memory check
-        if not check_memory_safe():
-            st.error("Memory usage too high. Please clear cache or reduce batch size.")
-            st.stop()
-        
-        # Progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        try:
-            # Phase 1: SHAP explanations
-            status_text.text("Phase 1/2: Generating SHAP explanations...")
-            shap_results = process_batch_shap(shap_explainer, X_sample, preds_sample, batch_size_shap)
-            progress_bar.progress(50)
-            
-            # Phase 2: LIME explanations  
-            status_text.text("Phase 2/2: Generating LIME explanations...")
-            lime_results = process_batch_lime(lime_explainer, X_sample, preds_sample, batch_size_lime)
-            progress_bar.progress(90)
-            
-            # Phase 3: Create ZIP
-            status_text.text("Finalizing ZIP file...")
-            zip_buf, successful_exports = create_explanations_zip(
-                shap_results, lime_results, selected_features, original_indices
-            )
-            progress_bar.progress(100)
-            
-            # Download ready
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            zip_filename = f"explanations_batch_{ts}_{successful_exports}_rows.zip"
-            
-            st.success(f"✅ Batch export completed! Successfully processed {successful_exports} rows.")
-            
-            st.download_button(
-                "⬇️ Download Explanations (ZIP)",
-                data=zip_buf.getvalue(),
-                file_name=zip_filename,
-                mime="application/zip",
-                key=f"download_{ts}"
+        unique_labels = results_df['Predicted_Label'].unique().tolist()
+        selected_class = st.selectbox("Select predicted class to inspect:", unique_labels, key='select_class_batch')
+        class_rows = results_df[results_df['Predicted_Label'] == selected_class]
+
+        if class_rows.empty:
+            st.warning("No rows for the selected class in this batch.")
+        else:
+            selected_row_index = st.selectbox(
+                "Select a row index from this class (DataFrame index):", 
+                class_rows.index.tolist(), key='select_row_batch'
             )
             
-        except Exception as e:
-            st.error(f"Batch processing failed: {e}")
-            st.info("Try reducing batch sizes or number of rows.")
-        
-        finally:
-            status_text.empty()
-            progress_bar.empty()
+            # Find the numpy index corresponding to the selected row's original index
+            # This logic must search only within the current batch's index set (df_sel_all.index)
+            
+            # Find the position of the selected row index within the current batch's *full* index list
+            # We use the raw index list from the current batch's subset of the cleaned data
+            current_batch_indices = df_sel_all.loc[results_df.index].index.values # Indices of rows currently in results_df
+            
+            numpy_row_idx_array = np.where(current_batch_indices == selected_row_index)[0]
+            if len(numpy_row_idx_array) == 0:
+                 st.error("Error: Could not find row in current batch data.")
+                 st.stop()
+            numpy_row_idx = numpy_row_idx_array[0] # The index in X_scaled (0 to batch_size-1)
+            
+
+            st.subheader("Selected Row Details")
+            st.dataframe(results_df.loc[[selected_row_index]])
+
+            col_shap, col_lime = st.columns(2)
+
+            # ---------------- SHAP (Local)
+            with col_shap:
+                st.subheader("SHAP (KernelExplainer)")
+                with st.spinner("Calculating SHAP values..."):
+                    shap_vals = shap_explainer.shap_values(X_scaled[numpy_row_idx:numpy_row_idx+1], nsamples=50) 
+                    pred_class_idx = int(preds[numpy_row_idx])
+
+                if pred_class_idx < len(shap_vals):
+                    shap_for_row = np.array(shap_vals[pred_class_idx])[0]
+                    predicted_label = results_df.loc[selected_row_index, 'Predicted_Label']
+                    fig_local = plot_shap_local(shap_for_row, selected_features, 
+                                                f"Local SHAP (Row {selected_row_index} - Class: {predicted_label})")
+                    st.pyplot(fig_local)
+                    plt.close(fig_local)
+                else:
+                    st.warning("SHAP explanation failed.")
+
+            # ---------------- LIME (Local)
+            with col_lime:
+                st.subheader("LIME (local)")
+                with st.spinner("Calculating LIME explanation..."):
+                    exp = lime_explainer.explain_instance(
+                        X_scaled[numpy_row_idx],
+                        predict_2d_to_3d,
+                        num_features=min(10, len(selected_features))
+                    )
+                predicted_label = results_df.loc[selected_row_index, 'Predicted_Label']
+                fig_lime = plot_lime_local(exp, f"LIME Explanation (Row {selected_row_index} - Class: {predicted_label})")
+                st.pyplot(fig_lime)
+                plt.close(fig_lime)
+                
+                st.write("Top contributions:")
+                st.write(pd.DataFrame(exp.as_list(), columns=["Feature", "Contribution"]))
+
+            st.markdown("---")
+            
+            # ----------------------------
+            # Batch export
+            # ----------------------------
+            st.header("📦 Batch Export Explanations (Current Batch Only)")
+            
+            # CRITICAL: Hard limit on rows for export
+            row_limit = st.number_input(
+                f"How many rows to explain (max: {MAX_ROWS_FOR_EXPLANATION}):",
+                min_value=1, 
+                max_value=min(MAX_ROWS_FOR_EXPLANATION, X_scaled.shape[0]), 
+                value=min(20, X_scaled.shape[0], MAX_ROWS_FOR_EXPLANATION), 
+                step=1,
+                key='export_limit_batch'
+            )
+
+            if st.button("Generate Batch Explanations (ZIP)", key='export_button_batch'):
+                with st.spinner("Generating batch explanations..."):
+                    zip_buf = BytesIO()
+                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        
+                        # 1. Write current batch prediction results CSV
+                        zip_csv_name = f"predictions_{current_batch_label}.csv"
+                        zf.writestr(zip_csv_name, results_df.to_csv(index=True).encode('utf-8'))
+                        
+                        # 2. Write global SHAP summary plot (based on this batch)
+                        fig_glob = plot_shap_global(shap_explainer, X_scaled, selected_features, n_samples=50)
+                        zip_img_name = f"shap_global_summary_{current_batch_label}.png"
+                        zf.writestr(zip_img_name, fig_to_bytes(fig_glob).getvalue())
+                        plt.close(fig_glob)
+
+                        all_lime_rows = []
+                        progress_bar = st.progress(0, text="Batch Explanation Progress...")
+                        
+                        for i in range(row_limit):
+                            # The indices used here are 0 to batch_size-1
+                            row_index_in_original_df = results_df.index[i] 
+                            
+                            # SHAP for row i (using lower nsamples for speed)
+                            shap_vals_row = shap_explainer.shap_values(X_scaled[i:i+1], nsamples=50) 
+                            pred_class_idx = int(preds[i])
+                            
+                            if pred_class_idx < len(shap_vals_row):
+                                pred_class_label = results_df.loc[row_index_in_original_df, 'Predicted_Label']
+                                shap_row_vals = np.array(shap_vals_row[pred_class_idx])[0]
+                                fig_s = plot_shap_local(shap_row_vals, selected_features, 
+                                                        f"SHAP Local (Row {row_index_in_original_df} - Class: {pred_class_label})")
+                                zf.writestr(f"shap_row_{row_index_in_original_df}.png", fig_to_bytes(fig_s).getvalue())
+                                plt.close(fig_s)
+                            
+                            # LIME for row i
+                            exp = lime_explainer.explain_instance(X_scaled[i], predict_2d_to_3d, num_features=10)
+                            
+                            fig_l = exp.as_pyplot_figure()
+                            fig_l.suptitle(f"LIME Local (Row {row_index_in_original_df})", y=1.02)
+                            plt.tight_layout()
+                            zf.writestr(f"lime_row_{row_index_in_original_df}.png", fig_to_bytes(fig_l).getvalue())
+                            plt.close(fig_l)
+
+                            # Collect LIME CSV rows
+                            for f, c in exp.as_list():
+                                all_lime_rows.append({"Row_Index": row_index_in_original_df, "Feature": f, "Contribution": c})
+                            
+                            progress_bar.progress(int(((i + 1) / row_limit) * 100), text=f"Batch Explanation Progress: {i+1} of {row_limit} rows")
+
+                        lime_df_all = pd.DataFrame(all_lime_rows)
+                        zf.writestr(f"lime_all_contributions_{current_batch_label}.csv", lime_df_all.to_csv(index=False).encode('utf-8'))
+
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    zipfname = f"explanations_{current_batch_label}_{ts}.zip"
+                    
+                    st.download_button(
+                        "⬇️ Download explanations (ZIP)",
+                        data=zip_buf.getvalue(),
+                        file_name=zipfname,
+                        mime="application/zip"
+                    )
+                    progress_bar.empty()
+                    st.success("Batch export completed!")
+
+elif rows_processed > 0:
+    st.success(f"✅ All {N_ROWS} rows processed across {N_BATCHES} batches! Reset application to analyze.")
 
 st.markdown("---")
-st.caption("Notes: Batch processing allows handling large datasets by processing in manageable chunks with memory monitoring.")
+if rows_processed == 0 and uploaded_file:
+    st.info("Click 'Process Next Batch' to begin analysis.")
+st.caption("Notes: The application only holds and displays results for the **last processed batch** to save memory. Use 'Clear Cache & Reset Data' to start over with a new file.")
